@@ -1,0 +1,3 @@
+retico-core
+retico-whisperasr
+pyaudio

@@ -1,0 +1,1 @@
+from retico_cozmofaceattention.cozmo_face_attention import FaceDetectionModule
