@@ -22,40 +22,34 @@ import math
 import cozmo
 from cozmo.util import degrees, distance_mm, speed_mmps
 
-# Local sweep positions after repositioning: (turn_delta_deg, head_offset_from_base_deg).
-# turn_delta is relative to previous position; head_offset is absolute from stored base angle.
-# Covers ±45° horizontal, ±10° vertical before giving up to full rescan.
-_SWEEP_STEPS = [
-    (-15,   0),   # 15° left,  base head
-    (-15,   0),   # 30° left,  base head
-    (-15,   0),   # 45° left,  base head
-    (+45,  10),   # center,    head up
-    (+30,  10),   # 30° right, head up
-    (  0, -10),   # 30° right, head down
-    (-30, -10),   # center,    head down
-    (-30, -10),   # 30° left,  head down
-]
-_HEAD_MIN = -25.0
-_HEAD_MAX  =  25.0
-# Only store opportunistic poses where the face appears at a reasonable distance.
-# Frames where the face is wider than this threshold mean Cozmo is too close;
-# returning to that stored position would put the face out of frame again.
-_MAX_OPPORTUNISTIC_FACE_PX = 100
+_HEAD_MAX          = 25.0
+_HEAD_CLOSE_BOOST  = 12.0
+_DIST_CLOSE_RATIO  = 0.8
+_DIST_FAR_RATIO    = 1.2
 
-CLOSE_THRESHOLD_PX  = 80     # face wider than this at storage time → too close; back up during sweep
-PROXIMITY_BACKUP_MM = 150.0  # distance to reverse before sweeping when too close
+# Depth fallback: estimated real face width used with pixel-width depth formula.
+_FACE_REAL_WIDTH_MM = 150
+
+# Triangulation: minimum robot displacement between stored observations.
+_FACE_OBS_MIN_DIST = 50    # mm
+_FACE_OBS_MAX      = 15    # keep this many observations
+
+# Bearing stability: when the robot is closer than this to the stored world
+# position, the bearing computed from that position is unreliable (estimate
+# error dominates). Fall back to the last stored world-frame bearing instead.
+_MIN_BEARING_DIST = 120    # mm
 
 
 class FaceDetectionModule(retico_core.AbstractModule):
     """Rotates Cozmo while scanning for a face. Once found, wanders randomly.
-    While wandering, opportunistically updates the stored face pose whenever the
-    face is visible, keeping it fresh. On "look", navigates back to the most
-    recent stored pose and verifies. If the face is not immediately visible, runs
-    a local sweep (small turns + head tilts) before falling back to full rescan.
+    During wander, re-estimates the person's world position whenever the face is
+    visible — keeps the estimate fresh and corrects odometry drift. On trigger word,
+    turns in place to face the person and adjusts head angle. Detects pose
+    delocalization via origin_id and re-scans automatically.
 
     Inputs:
         * ``ImageIU`` — Cozmo camera frames.
-        * ``SpeechRecognitionIU`` — "look" triggers repositioning.
+        * ``SpeechRecognitionIU`` — trigger word fires orientation.
     """
 
     @staticmethod
@@ -66,7 +60,7 @@ class FaceDetectionModule(retico_core.AbstractModule):
     def description():
         return (
             "Scans until a face is detected, wanders with live pose tracking, "
-            "and returns to the last known face pose on 'look'."
+            "and turns to face the person on trigger word."
         )
 
     @staticmethod
@@ -84,22 +78,28 @@ class FaceDetectionModule(retico_core.AbstractModule):
         self.faceCascade   = None
         self._lock         = threading.Lock()
 
-        # --- state flags ---
-        self._scanning      = False   # rotation scan loop active
-        self._wandering     = False   # random drive loop active
-        self._repositioning = False   # go_to_pose in progress
-        self._verifying     = False   # camera check after reposition
-        self._sweeping      = False   # local sweep search active
-        self._sweep_moving  = False   # within sweep: robot currently moving
+        # Camera intrinsics — populated in setup() from robot.camera.config.
+        self._cam_focal_x  = None
+        self._cam_center_x = None
 
-        self._verify_deadline = 0.0
-        self._sweep_found     = threading.Event()   # set by _confirm_face
-        self._wander_action   = None                # current wander SDK action for abort
+        self._scanning      = False
+        self._wandering     = False
+        self._repositioning = False
 
-        # --- stored face knowledge ---
-        self._last_face_pose     = None   # cozmo.util.Pose
-        self._last_head_angle    = None   # float degrees
-        self._last_face_width_px = None   # int pixels — distance proxy
+        self._wander_action = None
+
+        # Bearing observations: list of (robot_x, robot_y, world_bearing_rad).
+        # Each entry is a ray from a known robot position toward the person.
+        # Least-squares intersection of these rays gives the world position.
+        self._face_observations = []
+
+        # Person's estimated world position — updated on every face sighting.
+        self._face_world_x         = None  # mm
+        self._face_world_y         = None  # mm
+        self._face_world_bearing   = None  # world-frame bearing (rad) at last sighting
+        self._face_last_dist_mm    = None  # estimated distance at last sighting
+        self._face_last_head_angle = None  # head angle at last sighting
+        self._face_last_origin_id  = None  # robot.pose.origin_id at last sighting
 
         self._scan_thread   = None
         self._last_asr_text = ""
@@ -109,12 +109,12 @@ class FaceDetectionModule(retico_core.AbstractModule):
         self.faceCascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        cam_cfg = self.robot.camera.config
+        self._cam_focal_x  = cam_cfg.focal_length.x
+        self._cam_center_x = cam_cfg.center.x
+
         self._wandering     = False
         self._repositioning = False
-        self._verifying     = False
-        self._sweeping      = False
-        self._sweep_moving  = False
-        self._verify_deadline = 0.0
         self._start_scan()
 
     def shutdown(self):
@@ -122,9 +122,6 @@ class FaceDetectionModule(retico_core.AbstractModule):
             self._scanning      = False
             self._wandering     = False
             self._repositioning = False
-            self._verifying     = False
-            self._sweeping      = False
-            self._sweep_moving  = False
 
     # ------------------------------------------------------------------
     # Scan
@@ -132,17 +129,22 @@ class FaceDetectionModule(retico_core.AbstractModule):
 
     def _start_scan(self):
         with self._lock:
-            self._scanning     = True
-            self._wandering    = False
-            self._verifying    = False
-            self._sweeping     = False
-            self._sweep_moving = False
+            self._scanning  = True
+            self._wandering = False
+            # Clear all face knowledge — starting fresh in case of rescan.
+            self._face_observations    = []
+            self._face_world_x         = None
+            self._face_world_y         = None
+            self._face_world_bearing   = None
+            self._face_last_dist_mm    = None
+            self._face_last_head_angle = None
+            self._face_last_origin_id  = None
         self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
         self._scan_thread.start()
         print("[FaceDetection] Scanning for a face...")
 
     def _scan_loop(self):
-        _HEAD_ANGLES = [10, 20, 0, -10]   # cycle through on each backup
+        _HEAD_ANGLES = [10, 20, 0, -10]
         head_idx = 0
         try:
             self.robot.set_head_angle(degrees(_HEAD_ANGLES[head_idx])).wait_for_completed()
@@ -212,30 +214,123 @@ class FaceDetectionModule(retico_core.AbstractModule):
             time.sleep(0.1)
 
     # ------------------------------------------------------------------
-    # Pose storage
+    # Face knowledge storage — triangulation
     # ------------------------------------------------------------------
 
-    def _store_face_pose(self, face_width_px=None):
-        """Must be called under _lock."""
-        self._last_face_pose  = self.robot.pose
-        self._last_head_angle = round(self.robot.head_angle.degrees, 1)
-        if face_width_px is not None:
-            self._last_face_width_px = face_width_px
+    def _triangulate_face_position(self):
+        """Least-squares intersection of bearing rays stored in _face_observations.
+
+        Each observation (rx, ry, alpha) is a ray from (rx, ry) in world direction
+        alpha. Minimises sum of squared perpendicular distances to find the point
+        that best fits all rays. Returns (None, None) when degenerate (rays parallel).
+        Must be called under _lock.
+        """
+        obs = self._face_observations
+        if len(obs) < 2:
+            return None, None
+
+        A = np.zeros((2, 2))
+        b = np.zeros(2)
+        for (px, py, alpha) in obs:
+            d = np.array([math.cos(alpha), math.sin(alpha)])
+            M = np.eye(2) - np.outer(d, d)
+            p = np.array([px, py])
+            A += M
+            b += M @ p
+
+        det = abs(float(np.linalg.det(A)))
+        if det < 0.01:
+            # Rays are nearly parallel — no useful lateral baseline yet.
+            return None, None
+
+        P = np.linalg.solve(A, b)
+
+        # The solution must be in front of the most recent observation ray.
+        px0, py0, a0 = obs[-1]
+        fwd = (P[0] - px0) * math.cos(a0) + (P[1] - py0) * math.sin(a0)
+        if fwd < 50:
+            return None, None
+
+        return float(P[0]), float(P[1])
+
+    def _store_face_knowledge(self, face_box):
+        """Must be called under _lock.
+
+        Converts the face bounding box into a world-position estimate using:
+        1. The real camera intrinsics (focal length, principal point) from the SDK.
+        2. Multi-view triangulation when the robot has moved enough laterally.
+        3. Pixel-width depth as a fallback when triangulation is degenerate.
+        """
+        focal_x  = self._cam_focal_x
+        center_x = self._cam_center_x
+
+        x, _y, w, _h = face_box
+        face_cx = x + w / 2
+
+        # Horizontal bearing correction: face offset from image center → angle offset.
+        # Right in image = clockwise in world (decreasing yaw) → subtract.
+        horiz_offset_rad = math.atan((face_cx - center_x) / focal_x)
+        yaw           = self.robot.pose.rotation.angle_z.radians
+        world_bearing = yaw - horiz_offset_rad
+
+        # Pixel-width depth estimate — used as fallback only.
+        dist_mm_depth = (_FACE_REAL_WIDTH_MM * focal_x) / max(w, 1)
+
+        rx = self.robot.pose.position.x
+        ry = self.robot.pose.position.y
+
+        # Append new observation if the robot has moved far enough since the last one.
+        if not self._face_observations:
+            self._face_observations.append((rx, ry, world_bearing))
+        else:
+            lx, ly, _ = self._face_observations[-1]
+            if math.hypot(rx - lx, ry - ly) >= _FACE_OBS_MIN_DIST:
+                self._face_observations.append((rx, ry, world_bearing))
+                if len(self._face_observations) > _FACE_OBS_MAX:
+                    self._face_observations.pop(0)
+
+        # Prefer triangulated position; fall back to single-view depth estimate.
+        tx, ty = self._triangulate_face_position()
+        if tx is not None:
+            tri_dist = math.hypot(tx - rx, ty - ry)
+            if 100 < tri_dist < 6000:
+                self._face_world_x      = tx
+                self._face_world_y      = ty
+                self._face_last_dist_mm = tri_dist
+                print(
+                    f"[FaceDetection] Triangulated position ({tx:.0f}, {ty:.0f})mm  "
+                    f"dist={tri_dist:.0f}mm  obs={len(self._face_observations)}"
+                )
+            else:
+                # Triangulation gave an implausible result — use depth estimate.
+                self._face_world_x      = rx + dist_mm_depth * math.cos(world_bearing)
+                self._face_world_y      = ry + dist_mm_depth * math.sin(world_bearing)
+                self._face_last_dist_mm = dist_mm_depth
+        else:
+            self._face_world_x      = rx + dist_mm_depth * math.cos(world_bearing)
+            self._face_world_y      = ry + dist_mm_depth * math.sin(world_bearing)
+            self._face_last_dist_mm = dist_mm_depth
+
+        self._face_world_bearing   = world_bearing
+        self._face_last_head_angle = round(self.robot.head_angle.degrees, 1)
+        self._face_last_origin_id  = self.robot.pose.origin_id
 
     # ------------------------------------------------------------------
-    # Reposition
+    # Orient to face on trigger
     # ------------------------------------------------------------------
 
-    def _reposition_and_verify(self):
+    def _orient_to_face(self):
+        """Turn in place toward the person's world position and set head angle. No driving."""
         with self._lock:
             self._repositioning = True
             self._wandering     = False
-            self._sweeping      = False
-            self._verifying     = False
-            target_pose = self._last_face_pose
-            target_head = self._last_head_angle
+            target_x      = self._face_world_x
+            target_y      = self._face_world_y
+            stored_bearing = self._face_world_bearing
+            last_dist      = self._face_last_dist_mm
+            last_head      = self._face_last_head_angle
+            stored_orig    = self._face_last_origin_id
 
-        # Abort the current wander action so the robot is free for new commands.
         with self._lock:
             action = self._wander_action
             self._wander_action = None
@@ -246,132 +341,87 @@ class FaceDetectionModule(retico_core.AbstractModule):
                 pass
             time.sleep(0.2)
 
-        print(f"[FaceDetection] Returning to stored pose, head={target_head}°")
+        # Delocalization check: pose.origin_id increments on pickup/slip.
+        # The stored world position is in the old frame — must rescan.
+        if stored_orig is not None and self.robot.pose.origin_id != stored_orig:
+            print("[FaceDetection] Pose delocalized since last face sighting — rescanning")
+            with self._lock:
+                self._repositioning = False
+            self._start_scan()
+            return
+
+        print(f"[FaceDetection] Orienting to person at world ({target_x:.0f}, {target_y:.0f})mm")
         try:
-            cur  = self.robot.pose
-            dx   = target_pose.position.x - cur.position.x
-            dy   = target_pose.position.y - cur.position.y
-            dist = math.sqrt(dx * dx + dy * dy)
+            cur = self.robot.pose
+            dx  = target_x - cur.position.x
+            dy  = target_y - cur.position.y
+            cur_dist = math.hypot(dx, dy)
 
-            if dist > 20:
-                # Turn to face the target XY, then drive straight there
-                face_rad   = math.atan2(dy, dx)
-                cur_yaw    = cur.rotation.angle_z.radians
-                turn_delta = (face_rad - cur_yaw + math.pi) % (2 * math.pi) - math.pi
-                self.robot.turn_in_place(degrees(math.degrees(turn_delta))).wait_for_completed()
-                self.robot.drive_straight(distance_mm(dist), speed_mmps(150)).wait_for_completed()
+            if cur_dist < _MIN_BEARING_DIST:
+                # The robot is very close to the stored estimate — the estimate's
+                # depth error would make the bearing flip. Use the world-frame
+                # bearing from the last reliable sighting instead.
+                bearing = stored_bearing
+                print(
+                    f"[FaceDetection] cur_dist={cur_dist:.0f}mm < {_MIN_BEARING_DIST}mm — "
+                    f"using stored bearing {math.degrees(bearing):.1f}°"
+                )
+            else:
+                bearing = math.atan2(dy, dx)
 
-            # Turn to the stored body heading
-            target_yaw    = target_pose.rotation.angle_z.radians
-            cur_yaw       = self.robot.pose.rotation.angle_z.radians
-            heading_delta = (target_yaw - cur_yaw + math.pi) % (2 * math.pi) - math.pi
-            self.robot.turn_in_place(degrees(math.degrees(heading_delta))).wait_for_completed()
+            cur_yaw = cur.rotation.angle_z.radians
+            turn_d  = (bearing - cur_yaw + math.pi) % (2 * math.pi) - math.pi
+            self.robot.turn_in_place(degrees(math.degrees(turn_d))).wait_for_completed()
 
-            # Set stored head tilt
-            self.robot.set_head_angle(degrees(target_head)).wait_for_completed()
+            # Head angle: compare current distance to distance at last face sighting.
+            ratio = (cur_dist / last_dist) if (last_dist and last_dist > 0) else 1.0
+            if ratio < _DIST_CLOSE_RATIO:
+                head_angle = min(_HEAD_MAX, (last_head or 0.0) + _HEAD_CLOSE_BOOST)
+            elif ratio > _DIST_FAR_RATIO:
+                head_angle = 0.0
+            else:
+                head_angle = last_head if last_head is not None else 0.0
+
+            self.robot.set_head_angle(degrees(head_angle)).wait_for_completed()
+            print(
+                f"[FaceDetection] Oriented — bearing={math.degrees(bearing):.1f}°  "
+                f"cur_dist={cur_dist:.0f}mm  last_dist={last_dist:.0f}mm  "
+                f"ratio={ratio:.2f}  head={head_angle:.1f}°"
+            )
         except Exception as e:
-            print(f"[FaceDetection] Reposition error: {e}")
+            print(f"[FaceDetection] Orient error: {e}")
+
+        # Pause so the user can register that Cozmo is looking at them.
+        time.sleep(3)
 
         with self._lock:
-            self._repositioning   = False
-            self._verifying       = True
-            self._verify_deadline = time.time() + 2.0
-
-        print("[FaceDetection] Verifying face at stored position...")
+            self._repositioning = False
+            self._wandering     = True
+        threading.Thread(target=self._wander_loop, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Local sweep
+    # Face confirmed at scan time
     # ------------------------------------------------------------------
 
-    def _sweep_search(self):
-        """Small-angle search before falling back to full rotation rescan."""
+    def _confirm_face(self, faces, input_iu):
+        largest_face = max(faces, key=lambda f: f[2])
         with self._lock:
-            self._verifying    = False
-            self._sweeping     = True
-            self._sweep_moving = True
-            base_head          = self._last_head_angle
-            face_width_px      = self._last_face_width_px
+            self._scanning  = False
+            self._wandering = True
+            self._store_face_knowledge(face_box=largest_face)
+            world_x = self._face_world_x
+            world_y = self._face_world_y
+            dist    = self._face_last_dist_mm
+            head    = self._face_last_head_angle
 
-        print("[FaceDetection] Starting local sweep search...")
+        threading.Thread(target=self._wander_loop, daemon=True).start()
 
-        if face_width_px is not None and face_width_px > CLOSE_THRESHOLD_PX:
-            print(f"[FaceDetection] Sweep: stored face close ({face_width_px}px) — backing up {PROXIMITY_BACKUP_MM:.0f}mm")
-            try:
-                self.robot.drive_straight(
-                    distance_mm(-PROXIMITY_BACKUP_MM), speed_mmps(80)
-                ).wait_for_completed()
-            except Exception as e:
-                print(f"[FaceDetection] Sweep backup error: {e}")
-            self._sweep_found.clear()
-            with self._lock:
-                self._sweep_moving = False
-            if self._sweep_found.wait(timeout=0.8):
-                return
-
-        for turn_d, head_off in _SWEEP_STEPS:
-            with self._lock:
-                if not self._sweeping:   # face already found by image processing
-                    return
-                self._sweep_moving = True
-
-            try:
-                if abs(turn_d) > 0:
-                    self.robot.turn_in_place(degrees(turn_d)).wait_for_completed()
-                target_head = max(_HEAD_MIN, min(_HEAD_MAX, base_head + head_off))
-                self.robot.set_head_angle(degrees(target_head)).wait_for_completed()
-            except Exception as e:
-                print(f"[FaceDetection] Sweep move error: {e}")
-
-            # Clear event BEFORE enabling detection to avoid a race where
-            # the previous iteration's event fires into the new window.
-            self._sweep_found.clear()
-            with self._lock:
-                self._sweep_moving = False
-
-            if self._sweep_found.wait(timeout=0.8):
-                return   # _confirm_face was called by _process_image_iu
-
-        with self._lock:
-            self._sweeping = False
-        print("[FaceDetection] Sweep search failed — rescanning")
-        self._start_scan()
-
-    # ------------------------------------------------------------------
-    # Shared face-confirmation helper
-    # ------------------------------------------------------------------
-
-    def _confirm_face(self, faces, input_iu, start_wander):
-        largest_w = max(f[2] for f in faces)
-        with self._lock:
-            self._scanning     = False
-            self._verifying    = False
-            self._sweeping     = False
-            self._sweep_moving = False
-            self._wandering    = start_wander
-            self._store_face_pose(face_width_px=largest_w)
-            head = self._last_head_angle
-            pose = self._last_face_pose
-
-        # Unblock sweep thread (harmless when not sweeping).
-        self._sweep_found.set()
-
-        if start_wander:
-            threading.Thread(target=self._wander_loop, daemon=True).start()
-        else:
-            # After confirming via "look", pause briefly then resume wandering.
-            def _delayed_wander():
-                time.sleep(3)
-                with self._lock:
-                    if not self._wandering and not self._repositioning and not self._scanning:
-                        self._wandering = True
-                threading.Thread(target=self._wander_loop, daemon=True).start()
-            threading.Thread(target=_delayed_wander, daemon=True).start()
-
-        label = "scan" if start_wander else "look"
-        print(f"\n[FaceDetection] *** Face confirmed ({label})! ***")
-        print(f"[FaceDetection] Pose x={pose.position.x:.1f}  y={pose.position.y:.1f}  "
-              f"heading={pose.rotation.angle_z.degrees:.1f}°  head={head}°  "
-              f"face_px={largest_w}")
+        face_w = int(largest_face[2])
+        print(f"\n[FaceDetection] *** Face found! ***")
+        print(
+            f"[FaceDetection] Person at world ({world_x:.0f}, {world_y:.0f})mm  "
+            f"dist≈{dist:.0f}mm  head={head}°  face_px={face_w}"
+        )
 
         face_dict = {
             i: {"box": [(int(x), int(y)), (int(x + w), int(y + h))]}
@@ -409,14 +459,14 @@ class FaceDetectionModule(retico_core.AbstractModule):
             self._asr_final     = iu.final
             if (
                 "look" in iu.text.lower()
-                and self._last_face_pose is not None
+                and self._face_world_x is not None
                 and not self._repositioning
             ):
                 trigger = True
 
         if trigger:
-            print("[FaceDetection] 'look' heard — repositioning to last face pose")
-            threading.Thread(target=self._reposition_and_verify, daemon=True).start()
+            print("[FaceDetection] Trigger heard — orienting to face")
+            threading.Thread(target=self._orient_to_face, daemon=True).start()
 
     def _speech_snapshot(self):
         with self._lock:
@@ -426,26 +476,14 @@ class FaceDetectionModule(retico_core.AbstractModule):
         with self._lock:
             if self._repositioning:
                 return None
-            is_scanning    = self._scanning
-            is_wandering   = self._wandering
-            is_verifying   = self._verifying
-            is_sweeping    = self._sweeping
-            sweep_moving   = self._sweep_moving
-            deadline       = self._verify_deadline
+            is_scanning  = self._scanning
+            is_wandering = self._wandering
 
-        active = is_scanning or is_wandering or is_verifying or is_sweeping
-        if not active:
+        if not is_scanning and not is_wandering:
             return None
 
         image = np.asarray(input_iu.image)
-
-        # During a sweep move: just keep the display live, skip detection.
-        if is_sweeping and sweep_moving:
-            cv2.imshow("Cozmo Camera", image)
-            cv2.waitKey(1)
-            return None
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray  = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         faces = self.faceCascade.detectMultiScale(
             gray,
             scaleFactor=1.1,
@@ -460,34 +498,19 @@ class FaceDetectionModule(retico_core.AbstractModule):
         cv2.imshow("Cozmo Camera", display)
         cv2.waitKey(1)
 
-        # --- WANDER: opportunistic tracking, no state change ---
         if is_wandering:
+            # Opportunistically update the face world position whenever the face is
+            # visible during wander. New observation added only when robot has moved
+            # far enough to improve the triangulation baseline.
             if len(faces) > 0:
-                largest_w = max(f[2] for f in faces)
-                if largest_w <= _MAX_OPPORTUNISTIC_FACE_PX:
-                    with self._lock:
-                        self._store_face_pose(face_width_px=largest_w)
+                largest_face = max(faces, key=lambda f: f[2])
+                with self._lock:
+                    self._store_face_knowledge(face_box=largest_face)
             return None
 
-        # --- SCAN: first (or re-)detection ---
         if is_scanning:
             if len(faces) > 0:
-                return self._confirm_face(faces, input_iu, start_wander=True)
-            return None
-
-        # --- VERIFY: quick check after go_to_pose ---
-        if is_verifying:
-            if len(faces) > 0:
-                return self._confirm_face(faces, input_iu, start_wander=False)
-            if time.time() > deadline:
-                print("[FaceDetection] Face not visible — starting local sweep")
-                threading.Thread(target=self._sweep_search, daemon=True).start()
-            return None
-
-        # --- SWEEP: checking at current sweep position ---
-        if is_sweeping:
-            if len(faces) > 0:
-                return self._confirm_face(faces, input_iu, start_wander=False)
+                return self._confirm_face(faces, input_iu)
             return None
 
         return None
